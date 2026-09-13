@@ -14,12 +14,17 @@ set -u
 set -o pipefail
 
 readonly APP_NAME="VPS BENCH / ALL-IN-ONE"
-readonly APP_VERSION="1.0.0"
+readonly APP_VERSION="1.0.1"
 readonly RUN_ID="$(date -u +%Y%m%d-%H%M%S)"
 readonly START_EPOCH="$(date +%s)"
 readonly LOG_FILE="${VPS_BENCH_LOG_FILE:-./vps-bench-${RUN_ID}.log}"
 TEST_TIMEOUT="${VPS_BENCH_TIMEOUT:-900}"
 readonly DOWNLOAD_TIMEOUT="${VPS_BENCH_DOWNLOAD_TIMEOUT:-45}"
+
+# Some non-interactive SSH sessions do not export TERM. Several upstream
+# terminal-oriented checks expect it to exist even when they only emit text.
+TERM="${TERM:-xterm-256color}"
+export TERM
 
 DRY_RUN=0
 USE_NO_COLOR=0
@@ -242,8 +247,7 @@ run_command() {
   local rc
 
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '%s  [dry-run] %s%s\n' "$C_DIM" "$command_text" "$C_RESET"
-    printf '[dry-run] %s\n' "$command_text" >"$out_file"
+    printf '%s  [dry-run] %s%s\n' "$C_DIM" "$command_text" "$C_RESET" | tee -a "$out_file" "$LOG_FILE"
     return 0
   fi
 
@@ -251,13 +255,13 @@ run_command() {
   append_log "COMMAND [$CURRENT_TEST] $command_text"
   set +e
   if command -v timeout >/dev/null 2>&1; then
-    timeout --signal=TERM "$TEST_TIMEOUT" bash -c "$command_text" </dev/null 2>&1 | tee -a "$out_file"
+    timeout --signal=TERM "$TEST_TIMEOUT" bash -c "$command_text" </dev/null 2>&1 | tee -a "$out_file" "$LOG_FILE"
     rc="${PIPESTATUS[0]}"
   elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout --signal=TERM "$TEST_TIMEOUT" bash -c "$command_text" </dev/null 2>&1 | tee -a "$out_file"
+    gtimeout --signal=TERM "$TEST_TIMEOUT" bash -c "$command_text" </dev/null 2>&1 | tee -a "$out_file" "$LOG_FILE"
     rc="${PIPESTATUS[0]}"
   else
-    bash -c "$command_text" </dev/null 2>&1 | tee -a "$out_file"
+    bash -c "$command_text" </dev/null 2>&1 | tee -a "$out_file" "$LOG_FILE"
     rc="${PIPESTATUS[0]}"
   fi
   set -e
