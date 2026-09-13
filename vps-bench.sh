@@ -7,14 +7,14 @@
 #   bash vps-bench.sh --dry-run
 #   VPS_BENCH_TIMEOUT=900 bash vps-bench.sh
 #
-# The script intentionally does not install packages or use sudo. Missing tools
-# and unavailable third-party checks are reported as SKIP/FAIL instead.
+# The script installs only missing test dependencies when a supported package
+# manager and root/passwordless sudo are available. Use --no-install to opt out.
 
 set -u
 set -o pipefail
 
 readonly APP_NAME="VPS BENCH / ALL-IN-ONE"
-readonly APP_VERSION="1.0.1"
+readonly APP_VERSION="1.1.0"
 readonly RUN_ID="$(date -u +%Y%m%d-%H%M%S)"
 readonly START_EPOCH="$(date +%s)"
 readonly LOG_FILE="${VPS_BENCH_LOG_FILE:-./vps-bench-${RUN_ID}.log}"
@@ -28,6 +28,7 @@ export TERM
 
 DRY_RUN=0
 USE_NO_COLOR=0
+AUTO_INSTALL="${VPS_BENCH_AUTO_INSTALL:-1}"
 BASH_MAJOR="${BASH_VERSINFO[0]:-0}"
 CURRENT_TEST=""
 TOTAL=0
@@ -66,12 +67,14 @@ Runs the VPS checks used in the VPS topic and prints a unified report.
 
 Options:
   --dry-run       Render the complete UI without executing network tests.
+  --no-install    Do not install missing packages automatically.
   --no-color      Disable ANSI colors.
   --timeout SEC   Per-test timeout (default: 900 seconds).
   --help          Show this help.
 
 Environment:
   VPS_BENCH_LOG_FILE       Exact path for the raw combined log.
+  VPS_BENCH_AUTO_INSTALL   Set to 0 to disable dependency installation.
   VPS_BENCH_TIMEOUT        Per-test timeout in seconds.
   VPS_BENCH_DOWNLOAD_TIMEOUT
                            Timeout for downloading third-party scripts.
@@ -82,6 +85,9 @@ while (($#)); do
   case "$1" in
     --dry-run)
       DRY_RUN=1
+      ;;
+    --no-install)
+      AUTO_INSTALL=0
       ;;
     --no-color)
       USE_NO_COLOR=1
@@ -111,6 +117,11 @@ done
 
 if [[ ! "$TEST_TIMEOUT" =~ ^[0-9]+$ || "$TEST_TIMEOUT" -lt 1 ]]; then
   printf 'VPS_BENCH_TIMEOUT must be a positive integer.\n' >&2
+  exit 2
+fi
+
+if [[ "$AUTO_INSTALL" != 0 && "$AUTO_INSTALL" != 1 ]]; then
+  printf 'VPS_BENCH_AUTO_INSTALL must be 0 or 1.\n' >&2
   exit 2
 fi
 
@@ -172,6 +183,191 @@ status_tag() {
 
 append_log() {
   printf '%s %s\n' "[$(timestamp)]" "$*" >>"$LOG_FILE"
+}
+
+command_present() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+missing_requirements() {
+  command_present curl || printf '%s\n' curl
+  command_present wget || printf '%s\n' wget
+  command_present timeout || command_present gtimeout || printf '%s\n' timeout
+  command_present iperf3 || printf '%s\n' iperf3
+  command_present sysbench || printf '%s\n' sysbench
+  command_present fio || printf '%s\n' fio
+  command_present jq || printf '%s\n' jq
+  command_present bc || printf '%s\n' bc
+  command_present openssl || printf '%s\n' openssl
+  if [[ ! -f /etc/ssl/certs/ca-certificates.crt && ! -f /etc/pki/tls/certs/ca-bundle.crt ]]; then
+    printf '%s\n' ca-certificates
+  fi
+}
+
+detect_package_manager() {
+  if command_present apt-get; then
+    printf '%s' apt
+  elif command_present dnf; then
+    printf '%s' dnf
+  elif command_present yum; then
+    printf '%s' yum
+  elif command_present apk; then
+    printf '%s' apk
+  elif command_present zypper; then
+    printf '%s' zypper
+  elif command_present pacman; then
+    printf '%s' pacman
+  else
+    return 1
+  fi
+}
+
+package_name() {
+  local manager="$1" requirement="$2"
+  case "$manager:$requirement" in
+    apt:curl|dnf:curl|yum:curl|apk:curl|zypper:curl|pacman:curl) printf '%s' curl ;;
+    apt:wget|dnf:wget|yum:wget|apk:wget|zypper:wget|pacman:wget) printf '%s' wget ;;
+    apt:timeout|dnf:timeout|yum:timeout|apk:timeout|zypper:timeout|pacman:timeout) printf '%s' coreutils ;;
+    apt:iperf3|dnf:iperf3|yum:iperf3|apk:iperf3|zypper:iperf3|pacman:iperf3) printf '%s' iperf3 ;;
+    apt:sysbench|dnf:sysbench|yum:sysbench|apk:sysbench|zypper:sysbench|pacman:sysbench) printf '%s' sysbench ;;
+    apt:fio|dnf:fio|yum:fio|apk:fio|zypper:fio|pacman:fio) printf '%s' fio ;;
+    apt:jq|dnf:jq|yum:jq|apk:jq|zypper:jq|pacman:jq) printf '%s' jq ;;
+    apt:bc|dnf:bc|yum:bc|apk:bc|zypper:bc|pacman:bc) printf '%s' bc ;;
+    apt:openssl|dnf:openssl|yum:openssl|apk:openssl|zypper:openssl|pacman:openssl) printf '%s' openssl ;;
+    apt:ca-certificates|dnf:ca-certificates|yum:ca-certificates|apk:ca-certificates|zypper:ca-certificates|pacman:ca-certificates) printf '%s' ca-certificates ;;
+    *) return 1 ;;
+  esac
+}
+
+contains_word() {
+  case " $1 " in
+    *" $2 "*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+run_privileged() {
+  if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+    "$@"
+    return $?
+  fi
+  if command_present sudo && sudo -n true 2>/dev/null; then
+    sudo -n "$@"
+    return $?
+  fi
+  return 126
+}
+
+install_with_manager() {
+  local manager="$1" rc
+  shift
+  case "$manager" in
+    apt)
+      run_privileged env DEBIAN_FRONTEND=noninteractive apt-get update -qq 2>&1 | tee -a "$LOG_FILE"
+      rc="${PIPESTATUS[0]}"
+      ((rc == 0)) || return "$rc"
+      run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" 2>&1 | tee -a "$LOG_FILE"
+      return "${PIPESTATUS[0]}"
+      ;;
+    dnf)
+      dnf_args=("$@")
+      run_privileged dnf install -y "${dnf_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+      return "${PIPESTATUS[0]}"
+      ;;
+    yum)
+      yum_args=("$@")
+      run_privileged yum install -y "${yum_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+      return "${PIPESTATUS[0]}"
+      ;;
+    apk)
+      apk_args=("$@")
+      run_privileged apk add --no-cache "${apk_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+      return "${PIPESTATUS[0]}"
+      ;;
+    zypper)
+      zypper_args=("$@")
+      run_privileged zypper --non-interactive install --no-recommends "${zypper_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+      return "${PIPESTATUS[0]}"
+      ;;
+    pacman)
+      pacman_args=("$@")
+      run_privileged pacman -Sy --noconfirm --needed "${pacman_args[@]}" 2>&1 | tee -a "$LOG_FILE"
+      return "${PIPESTATUS[0]}"
+      ;;
+    *)
+      return 127
+      ;;
+  esac
+}
+
+bootstrap_dependencies() {
+  local missing manager requirement package packages missing_display remaining
+  missing="$(missing_requirements)"
+  if [[ -z "$missing" ]]; then
+    printf '%s  Dependencies: ready%s\n' "$C_GREEN" "$C_RESET"
+    append_log 'DEPENDENCY_CHECK status=ready'
+    return 0
+  fi
+
+  missing_display="$(printf '%s\n' "$missing" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    printf '%s  [dry-run] Missing dependencies: %s%s\n' "$C_YELLOW" "$missing_display" "$C_RESET"
+    append_log "DEPENDENCY_CHECK status=dry-run missing=$missing_display"
+    return 0
+  fi
+  if [[ "$AUTO_INSTALL" -ne 1 ]]; then
+    printf '%s  Auto-install disabled. Missing: %s%s\n' "$C_YELLOW" "$missing_display" "$C_RESET"
+    append_log "DEPENDENCY_CHECK status=disabled missing=$missing_display"
+    return 1
+  fi
+
+  manager="$(detect_package_manager || true)"
+  if [[ -z "$manager" ]]; then
+    printf '%s  No supported package manager found. Missing: %s%s\n' "$C_RED" "$missing_display" "$C_RESET"
+    append_log "DEPENDENCY_CHECK status=no-package-manager missing=$missing_display"
+    return 1
+  fi
+  if [[ "${EUID:-$(id -u)}" -ne 0 ]] && ! (command_present sudo && sudo -n true 2>/dev/null); then
+    printf '%s  Root or passwordless sudo is required to install: %s%s\n' "$C_RED" "$missing_display" "$C_RESET"
+    append_log "DEPENDENCY_CHECK status=insufficient-privileges manager=$manager missing=$missing_display"
+    return 1
+  fi
+
+  packages=""
+  while IFS= read -r requirement; do
+    [[ -n "$requirement" ]] || continue
+    package="$(package_name "$manager" "$requirement" || true)"
+    [[ -n "$package" ]] || continue
+    if ! contains_word "$packages" "$package"; then
+      packages="${packages:+$packages }$package"
+    fi
+  done <<<"$missing"
+
+  if [[ -z "$packages" ]]; then
+    printf '%s  Could not map missing dependencies for %s: %s%s\n' "$C_RED" "$manager" "$missing_display" "$C_RESET"
+    append_log "DEPENDENCY_CHECK status=unmapped manager=$manager missing=$missing_display"
+    return 1
+  fi
+
+  printf '%s%s DEPENDENCY BOOTSTRAP %s%s\n' "$C_BOLD" "$C_CYAN" "$C_RESET" "$(repeat_char '─' $((WIDTH - 25)))"
+  printf '  Package manager: %s\n' "$manager"
+  printf '  Installing missing: %s\n' "$packages"
+  append_log "DEPENDENCY_INSTALL manager=$manager packages=$packages"
+  if ! install_with_manager "$manager" $packages; then
+    printf '%s  Package installation failed; tests will continue with available tools.%s\n' "$C_RED" "$C_RESET"
+    append_log "DEPENDENCY_INSTALL status=failed manager=$manager packages=$packages"
+    return 1
+  fi
+
+  remaining="$(missing_requirements)"
+  if [[ -z "$remaining" ]]; then
+    printf '%s  Dependencies installed and verified.%s\n' "$C_GREEN" "$C_RESET"
+    append_log "DEPENDENCY_INSTALL status=verified manager=$manager packages=$packages"
+    return 0
+  fi
+  printf '%s  Installation finished, but still missing: %s%s\n' "$C_YELLOW" "$(printf '%s\n' "$remaining" | tr '\n' ' ')" "$C_RESET"
+  append_log "DEPENDENCY_INSTALL status=partial manager=$manager remaining=$remaining"
+  return 1
 }
 
 print_header() {
@@ -358,7 +554,7 @@ print_summary() {
   if ((FAILED > 0)); then
     printf '%s%s  One or more checks failed. Read the raw output above and the log file.%s\n' "$C_RED" "$C_BOLD" "$C_RESET"
   elif ((SKIPPED > 0)); then
-    printf '%s  Completed with skipped checks. Install the missing tools or rerun on the target Linux VPS.%s\n' "$C_YELLOW" "$C_RESET"
+    printf '%s  Completed with skipped checks. Review dependency bootstrap and rerun if needed.%s\n' "$C_YELLOW" "$C_RESET"
   else
     printf '%s  All checks returned successfully. Review the measurements, not only the exit codes.%s\n' "$C_GREEN" "$C_RESET"
   fi
@@ -373,6 +569,7 @@ cleanup() {
 trap cleanup EXIT
 
 print_header
+bootstrap_dependencies || true
 print_system_snapshot
 
 if ! have_downloader && [[ "$DRY_RUN" -eq 0 ]]; then
